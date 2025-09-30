@@ -61,7 +61,14 @@ esp_bootloader_esp_idf::esp_app_desc!();
 type SpiDevice = ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>;
 type DisplayInterface = SpiInterface<'static, SpiDevice, Output<'static>>;
 type DisplayDriver = mipidsi::Display<DisplayInterface, ST7789, Output<'static>>;
-type TouchEvent = ();
+
+#[derive(Clone, Copy, Debug)]
+pub enum GestureEvent {
+    Touch { x: u16, y: u16 },
+    Swipe { start_x: u16, start_y: u16, end_x: u16, end_y: u16 },
+}
+
+type TouchEvent = GestureEvent;
 
 const DISPLAY_WIDTH: u16 = 172;
 const DISPLAY_HEIGHT: u16 = 320;
@@ -234,6 +241,44 @@ impl DrawTarget for SimpleFb<'_> {
     }
 }
 
+fn draw_text_label(display: &mut DisplayDriver, fb_buf: &mut [Rgb565], text: &str) {
+    // 1) Render text into offscreen framebuffer
+    let text_style = MonoTextStyle::new(&FONT_9X18, Rgb565::BLACK);
+    let mut fb = SimpleFb::new(fb_buf);
+    fb.clear(Rgb565::WHITE);
+    
+    let text_obj = Text::with_alignment(text, Point::new(0, 18), text_style, Alignment::Left);
+    let _ = text_obj.draw(&mut fb);
+
+    // 2) Choose scale to make text large
+    let max_usable_height = (DISPLAY_HEIGHT - 10) as i32;
+    let scale = max_usable_height / FB_H as i32;
+    let out_h = (FB_H as i32 * scale) as u16;
+
+    // 3) Position on screen - left-aligned with margin
+    let bb = display.bounding_box();
+    let margin = 10i32;
+    let cy = bb.center().y.max(0) as i32;
+    let origin_x = margin;
+    let origin_y = cy - (out_h as i32 / 2);
+
+    // 4) Blit with nearest-neighbor scaling
+    for sy in 0..FB_H {
+        for sx in 0..FB_W {
+            let src = fb_buf[sy * FB_W + sx];
+            if src != Rgb565::WHITE {
+                let x = origin_x + (sx as i32 * scale);
+                let y = origin_y + (sy as i32 * scale);
+                
+                if x >= 0 && y >= 0 && (y + scale) <= DISPLAY_HEIGHT as i32 {
+                    let rect = Rectangle::new(Point::new(x, y), Size::new(scale as u32, scale as u32));
+                    let _ = rect.into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(src)).draw(display);
+                }
+            }
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn display_task(
     display: &'static mut DisplayDriver,
@@ -243,7 +288,7 @@ async fn display_task(
     let fb_buf = FB_STORAGE.init([Rgb565::BLACK; FB_W * FB_H]);
 
     loop {
-        let _ = events.receive().await;
+        let gesture_event = events.receive().await;
         
         let now = Instant::now();
         let ms_elapsed = {
@@ -253,7 +298,7 @@ async fn display_task(
                     let elapsed = now.duration_since(start_time);
                     elapsed.as_millis() as u32
                 }
-                None => 0, // First touch
+                None => 0, // First gesture
             };
             
             // Reset timer for next measurement
@@ -270,7 +315,6 @@ async fn display_task(
         
         match display.fill_solid(&area, color) {
             Ok(_) => {
-                let raw = color.into_storage();
                 
                 // Linear formula: f(time) = a * time + b
                 // Where: a = -0.1, b = 110
@@ -282,10 +326,18 @@ async fn display_task(
                     let result = a * (ms_elapsed as f32) + b;
                     (result as u32).max(1) // Minimum 1 point
                 } else {
-                    100 // First touch gets 100 points
+                    100 // First gesture gets 100 points
                 };
                 
-                info!("display color: {=u16:x}, elapsed: {}ms -> points: +{}", raw, ms_elapsed, points);
+                match gesture_event {
+                    GestureEvent::Touch { x, y } => {
+                        info!("TOUCH at ({}, {}), elapsed: {}ms -> points: +{}", x, y, ms_elapsed, points);
+                    }
+                    GestureEvent::Swipe { start_x, start_y, end_x, end_y } => {
+                        info!("SWIPE from ({}, {}) to ({}, {}), elapsed: {}ms -> points: +{}", 
+                              start_x, start_y, end_x, end_y, ms_elapsed, points);
+                    }
+                }
                 
                 // Display the calculated points with + prefix
                 draw_num_with_prefix(display, fb_buf, points, true);
@@ -295,31 +347,97 @@ async fn display_task(
     }
 }
 
+// Simple integer square root approximation
+fn approximate_sqrt(n: u32) -> u32 {
+    if n == 0 { return 0; }
+    if n == 1 { return 1; }
+    
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
 #[embassy_executor::task]
 async fn touch_task(
     touch: &'static mut Axs5106l<I2c<'static, Blocking>, Output<'static>>,
     events: &'static Channel<NoopRawMutex, TouchEvent, 4>,
 ) {
-    // Simple polling loop: ~100 Hz with rising-edge detection for touches
+    // Enhanced touch detection with swipe recognition
     let mut touch_active = false;
+    let mut touch_start: Option<(u16, u16)> = None;
+    let mut last_position: Option<(u16, u16)> = None;
+    
+    // Swipe detection parameters
+    const MIN_SWIPE_DISTANCE: u16 = 30; // Minimum distance to consider it a swipe
+    const MAX_TOUCH_DISTANCE: u16 = 10;  // Maximum movement for a tap
 
     loop {
         match touch.get_touch_data() {
             Ok(Some(report)) => {
-                if !touch_active {
-                    events.send(()).await;
-                    for point in report.points.iter() {
-                        info!("touch: ({}, {})", point.x, point.y);
+                if let Some(point) = report.points.first() {
+                    let current_pos = (point.x, point.y);
+                    
+                    if !touch_active {
+                        // First touch detected - record starting position
+                        touch_start = Some(current_pos);
+                        last_position = Some(current_pos);
+                        touch_active = true;
+                        info!("touch start: ({}, {})", point.x, point.y);
+                    } else {
+                        // Update last known position while touch is active
+                        last_position = Some(current_pos);
                     }
-                    touch_active = true;
                 }
             }
             Ok(None) => {
-                touch_active = false;
+                // Touch ended - determine if it was a touch or swipe
+                if touch_active {
+                    if let (Some((start_x, start_y)), Some((end_x, end_y))) = (touch_start, last_position) {
+                        // Calculate distance moved (using squared distance to avoid sqrt)
+                        let dx = (end_x as i32) - (start_x as i32);
+                        let dy = (end_y as i32) - (start_y as i32);
+                        let distance_squared = (dx * dx + dy * dy) as u32;
+                        let distance = approximate_sqrt(distance_squared) as u16;
+                        
+                        let gesture = if distance >= MIN_SWIPE_DISTANCE {
+                            // Swipe detected
+                            info!("swipe detected: ({}, {}) -> ({}, {}), distance: {}", 
+                                  start_x, start_y, end_x, end_y, distance);
+                            GestureEvent::Swipe { 
+                                start_x, 
+                                start_y, 
+                                end_x, 
+                                end_y 
+                            }
+                        } else {
+                            // Simple touch/tap
+                            info!("touch detected: ({}, {}), distance: {}", 
+                                  start_x, start_y, distance);
+                            GestureEvent::Touch { 
+                                x: start_x, 
+                                y: start_y 
+                            }
+                        };
+                        
+                        events.send(gesture).await;
+                    }
+                    
+                    // Reset state
+                    touch_active = false;
+                    touch_start = None;
+                    last_position = None;
+                }
             }
             Err(_) => {
                 info!("touch read error");
                 touch_active = false;
+                touch_start = None;
+                last_position = None;
             }
         }
         Timer::after(Duration::from_millis(10)).await;
