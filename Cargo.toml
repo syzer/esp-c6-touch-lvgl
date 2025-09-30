@@ -45,8 +45,10 @@ esp-wifi = { version = "0.15.0", features = [
   "esp32c6",
 ] }
 embedded-graphics-core = { version = "0.4.0", default-features = false }
+embedded-graphics = { version = "0.8.1", default-features = false }
 embedded-hal-bus = "0.3.0"
-mipidsi = { path = "../mipidsi" }
+mipidsi = "0.9.0"
+profont = "0.7.0"
 panic-rtt-target = { version = "0.2.0", features = ["defmt"] }
 rtt-target = { version = "0.6.1", features = ["defmt"] }
 static_cell = "2.1.1"

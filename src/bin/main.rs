@@ -7,7 +7,18 @@
 )]
 
 use bt_hci::controller::ExternalController;
+use core::convert::Infallible;
 use defmt::info;
+use embedded_graphics::{
+    draw_target::DrawTarget,
+    mono_font::MonoTextStyle,
+    mono_font::ascii::FONT_9X18,
+    primitives::{Primitive, Rectangle},
+    pixelcolor::Rgb565,
+    prelude::*,
+    text::{Alignment, Text},
+    Drawable,
+};
 use embassy_executor::Spawner;
 use embassy_sync::{
     blocking_mutex::raw::NoopRawMutex,
@@ -30,10 +41,6 @@ use esp_wifi::ble::controller::BleConnector;
 use panic_rtt_target as _;
 use static_cell::StaticCell;
 
-use embedded_graphics_core::{
-    pixelcolor::Rgb565,
-    prelude::*,
-};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use mipidsi::{
     interface::SpiInterface,
@@ -57,6 +64,7 @@ type TouchEvent = ();
 
 const DISPLAY_WIDTH: u16 = 172;
 const DISPLAY_HEIGHT: u16 = 320;
+
 const DISPLAY_X_OFFSET: u16 = 34;
 const DISPLAY_Y_OFFSET: u16 = 0;
 const SPI_BUFFER_SIZE: usize = 1024;
@@ -70,10 +78,49 @@ const RAINBOW: [Rgb565; 7] = [
     Rgb565::new(31, 0, 31),  // Violet
 ];
 
+const FB_W: usize = 86;   // enough for "+5" in 9x18 with padding
+const FB_H: usize = 24;   // 18px font + margin
+
+static FB_STORAGE: StaticCell<[Rgb565; FB_W * FB_H]> = StaticCell::new();
 static SPI_BUFFER: StaticCell<[u8; SPI_BUFFER_SIZE]> = StaticCell::new();
 static DISPLAY: StaticCell<DisplayDriver> = StaticCell::new();
 static TOUCH: StaticCell<Axs5106l<I2c<'static, Blocking>, Output<'static>>> = StaticCell::new();
 static TOUCH_EVENTS: StaticCell<Channel<NoopRawMutex, TouchEvent, 4>> = StaticCell::new();
+
+struct SimpleFb<'a> {
+    buf: &'a mut [Rgb565],
+}
+
+impl<'a> SimpleFb<'a> {
+    fn new(storage: &'a mut [Rgb565]) -> Self { Self { buf: storage } }
+    fn clear(&mut self, color: Rgb565) {
+        for px in self.buf.iter_mut() { *px = color; }
+    }
+}
+
+impl OriginDimensions for SimpleFb<'_> {
+    fn size(&self) -> Size { Size::new(FB_W as u32, FB_H as u32) }
+}
+
+impl DrawTarget for SimpleFb<'_> {
+    type Color = Rgb565;
+    type Error = Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(Point { x, y }, color) in pixels {
+            if x >= 0 && y >= 0 {
+                let (x, y) = (x as usize, y as usize);
+                if x < FB_W && y < FB_H {
+                    self.buf[y * FB_W + x] = color;
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 #[embassy_executor::task]
 async fn display_task(
@@ -81,17 +128,58 @@ async fn display_task(
     events: &'static Channel<NoopRawMutex, TouchEvent, 4>,
 ) {
     let mut lfsr: u32 = 0xACE1u32;
+        let fb_buf = FB_STORAGE.init([Rgb565::BLACK; FB_W * FB_H]);
+
     loop {
         let _ = events.receive().await;
         lfsr ^= lfsr << 13;
         lfsr ^= lfsr >> 17;
         lfsr ^= lfsr << 5;
-        let color = RAINBOW[(lfsr as usize) % RAINBOW.len()];
+        let color = RAINBOW[(lfsr as usize) % RAINBOW.len()]; // TODO random color
         let area = display.bounding_box();
         match display.fill_solid(&area, color) {
             Ok(_) => {
                 let raw = color.into_storage();
                 info!("display color: {=u16:x}", raw);
+                
+                // 1) Render small text into offscreen framebuffer
+                let text_style = MonoTextStyle::new(&FONT_9X18, Rgb565::BLACK);
+                let mut fb = SimpleFb::new(fb_buf);
+                fb.clear(Rgb565::WHITE);
+                let text = Text::with_alignment("+5", Point::new(0, 18), text_style, Alignment::Left);
+                let _ = text.draw(&mut fb);
+
+                // 2) Choose scale so height > 100 px but fits the screen
+                let min_target_h = 100i32;
+                let mut scale = (min_target_h + FB_H as i32 - 1) / FB_H as i32; // ceil
+                if scale < 2 { scale = 2; }
+                // keep within screen bounds
+                while (FB_W as i32 * scale) as u16 > DISPLAY_WIDTH || (FB_H as i32 * scale) as u16 > DISPLAY_HEIGHT {
+                    scale -= 1;
+                    if scale <= 1 { break; }
+                }
+                let out_w = (FB_W as i32 * scale) as u16;
+                let out_h = (FB_H as i32 * scale) as u16;
+
+                // 3) Center on screen
+                let bb = display.bounding_box();
+                let cx = bb.center().x.max(0) as i32;
+                let cy = bb.center().y.max(0) as i32;
+                let origin_x = cx - (out_w as i32 / 2);
+                let origin_y = cy - (out_h as i32 / 2);
+
+                // 4) Blit with nearest-neighbor: draw each source pixel as a filled rect of size scale
+                for sy in 0..FB_H {
+                    for sx in 0..FB_W {
+                        let src = fb_buf[sy * FB_W + sx];
+                        if src != Rgb565::WHITE { // treat white as transparent/background
+                            let x = origin_x + (sx as i32 * scale);
+                            let y = origin_y + (sy as i32 * scale);
+                            let rect = Rectangle::new(Point::new(x, y), Size::new(scale as u32, scale as u32));
+                            let _ = rect.into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(src)).draw(display);
+                        }
+                    }
+                }
             }
             Err(_) => info!("display fill error"),
         }
@@ -163,7 +251,7 @@ async fn main(spawner: Spawner) {
     let mut display = DisplayBuilder::new(ST7789, di)
         .display_size(DISPLAY_WIDTH, DISPLAY_HEIGHT)
         .display_offset(DISPLAY_X_OFFSET, DISPLAY_Y_OFFSET)
-        .orientation(Orientation::default().rotate(Rotation::Deg270))
+        .orientation(Orientation::default().rotate(Rotation::Deg90).flip_horizontal())   // or .mirror_x(true) depending on version
         .reset_pin(rst_lcd)
         .init(&mut delay)
         .expect("failed to initialise display");
