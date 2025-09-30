@@ -62,7 +62,7 @@ type SpiDevice = ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>
 type DisplayInterface = SpiInterface<'static, SpiDevice, Output<'static>>;
 type DisplayDriver = mipidsi::Display<DisplayInterface, ST7789, Output<'static>>;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, defmt::Format)]
 pub enum GestureEvent {
     Touch { x: u16, y: u16 },
     Swipe { start_x: u16, start_y: u16, end_x: u16, end_y: u16 },
@@ -76,30 +76,24 @@ const DISPLAY_HEIGHT: u16 = 320;
 const DISPLAY_X_OFFSET: u16 = 34;
 const DISPLAY_Y_OFFSET: u16 = 0;
 const SPI_BUFFER_SIZE: usize = 1024;
-// Original RGB RAINBOW (for reference)
-// const RAINBOW: [Rgb565; 7] = [
-//     Rgb565::new(31, 0, 0),   // Red
-//     Rgb565::new(31, 20, 0),  // Orange
-//     Rgb565::new(31, 63, 0),  // Yellow
-//     Rgb565::new(0, 63, 0),   // Green
-//     Rgb565::new(0, 0, 31),   // Blue
-//     Rgb565::new(8, 0, 31),   // Indigo
-//     Rgb565::new(31, 0, 31),  // Violet
-// ];
 
 // BGR RAINBOW (R and B channels swapped for BGR display)
 const RAINBOW: [Rgb565; 7] = [
     Rgb565::new(0, 0, 31),   // Red (R and B swapped)
-    Rgb565::new(0, 20, 31),  // Orange (R and B swapped)
+    Rgb565::new(0, 45, 31),  // Orange (R and B swapped) - more yellow-orange
     Rgb565::new(0, 63, 31),  // Yellow (R and B swapped)
     Rgb565::new(0, 63, 0),   // Green (stays same)
     Rgb565::new(31, 0, 0),   // Blue (R and B swapped)
-    Rgb565::new(31, 0, 8),   // Indigo (R and B swapped)
+    Rgb565::new(31, 63, 0),  // Cyan (R and B swapped - bright blue-green)
     Rgb565::new(31, 0, 31),  // Violet (stays same - symmetric)
 ];
 
 const FB_W: usize = 100;  // Extra wide to ensure no cut-off in framebuffer
 const FB_H: usize = 24;   // Keep height small for big vertical scaling
+
+// Timing constants for display sequence
+const COLOR_DISPLAY_DURATION_MS: u64 = 1000;  // Time each color is displayed (1 second)
+const CYCLE_PAUSE_DURATION_MS: u64 = 2000;    // Pause between color cycles (2 seconds)
 
 static FB_STORAGE: StaticCell<[Rgb565; FB_W * FB_H]> = StaticCell::new();
 static SPI_BUFFER: StaticCell<[u8; SPI_BUFFER_SIZE]> = StaticCell::new();
@@ -337,16 +331,27 @@ fn draw_text_label(display: &mut DisplayDriver, fb_buf: &mut [Rgb565], text: &st
     let text_obj = Text::with_alignment(text, Point::new(0, 18), text_style, Alignment::Left);
     let _ = text_obj.draw(&mut fb);
 
-    // 2) Choose scale to make text large
+    // 2) Calculate scale based on both width and height constraints
     let max_usable_height = (DISPLAY_HEIGHT - 10) as i32;
-    let scale = max_usable_height / FB_H as i32;
+    let max_usable_width = (DISPLAY_WIDTH * 3 / 4) as i32;  // 3/4 of screen width
+    
+    // Estimate text width in pixels (each character is roughly 9 pixels wide in FONT_9X18)
+    let text_width_pixels = text.len() as i32 * 9;
+    
+    // Calculate scale factors for both dimensions
+    let height_scale = max_usable_height / FB_H as i32;
+    let width_scale = max_usable_width / text_width_pixels;
+    
+    // Use the smaller scale to ensure text fits in both dimensions
+    let scale = height_scale.min(width_scale).max(1); // Ensure scale is at least 1
     let out_h = (FB_H as i32 * scale) as u16;
 
-    // 3) Position on screen - left-aligned with margin
+    // 3) Position on screen - centered horizontally
     let bb = display.bounding_box();
-    let margin = 10i32;
     let cy = bb.center().y.max(0) as i32;
-    let origin_x = margin;
+    let cx = bb.center().x.max(0) as i32;
+    let text_display_width = text_width_pixels * scale;
+    let origin_x = cx - (text_display_width / 2);
     let origin_y = cy - (out_h as i32 / 2);
 
     // 4) Blit with nearest-neighbor scaling
@@ -373,109 +378,123 @@ async fn display_task(
 ) {
     let mut lfsr: u32 = 0xACE1u32;
     let fb_buf = FB_STORAGE.init([Rgb565::BLACK; FB_W * FB_H]);
+    let area = display.bounding_box();
+    let color_names = ["Red", "Orange", "Yellow", "Green", "Blue", "Cyan", "Violet"];
 
     loop {
-        let gesture_event = events.receive().await;
+        info!("Starting 3-second sequence with 3 random colors");
         
-        let now = Instant::now();
-        let ms_elapsed = {
-            let mut timer_start = TIMER_START.lock().await;
-            let elapsed_ms = match *timer_start {
-                Some(start_time) => {
-                    let elapsed = now.duration_since(start_time);
-                    elapsed.as_millis() as u32
-                }
-                None => 0, // First gesture
-            };
+        // Show 3 random colors in 3 seconds (1 second each)
+        let text_overlays = ["All", "ways", "blue"];
+        
+        for i in 0..3 {
+            // Generate random color
+            lfsr ^= lfsr << 13;
+            lfsr ^= lfsr >> 17;
+            lfsr ^= lfsr << 5;
+            let color_index = (lfsr as usize) % RAINBOW.len();
+            let color = RAINBOW[color_index];
             
-            // Reset timer for next measurement
-            *timer_start = Some(now);
-            elapsed_ms
-        };
-        
-        // Generate new color
-        lfsr ^= lfsr << 13;
-        lfsr ^= lfsr >> 17;
-        lfsr ^= lfsr << 5;
-        let color = RAINBOW[(lfsr as usize) % RAINBOW.len()];
-        let area = display.bounding_box();
-        
-        match display.fill_solid(&area, color) {
-            Ok(_) => {
-                // Print current color to console
-                let raw_color = color.into_storage();
-                
-                // Generate color name by comparing with actual RAINBOW array values
-                let color_names = ["Red", "Orange", "Yellow", "Green", "Blue", "Indigo", "Violet"];
-                let mut color_name = "Unknown";
-                let mut color_index = None;
-                
-                for (i, rainbow_color) in RAINBOW.iter().enumerate() {
-                    if rainbow_color.into_storage() == raw_color {
-                        color_name = color_names[i];
-                        color_index = Some(i);
-                        break;
-                    }
+            // Display color
+            match display.fill_solid(&area, color) {
+                Ok(_) => {
+                    info!("Color {}: {} (index: {})", i + 1, color_names[color_index], color_index);
+                    // Display text overlay on the color
+                    draw_text_label(display, fb_buf, text_overlays[i]);
                 }
-                
-                info!("Current color displayed: {} (raw: {=u16:x})", color_name, raw_color);
-                
-                // Check if current color is blue (index 4 in RAINBOW array)
-                let is_blue = color_index == Some(4); // Blue is at index 4 in RAINBOW
-                
-                // Calculate base points using linear formula
-                let base_points = if ms_elapsed > 0 {
-                    let a = -0.2_f32;
-                    let b = 110.0_f32;
-                    let result = a * (ms_elapsed as f32) + b;
-                    (result as i32).max(1) // Minimum 1 point
-                } else {
-                    100 // First gesture gets 100 points
-                };
-                
-                // Apply gesture rules based on color
-                let points = match (gesture_event, is_blue) {
-                    (GestureEvent::Touch { x, y }, true) => {
-                        // Touch on blue = penalty (blue requires swipe)
-                        info!("TOUCH on BLUE at ({}, {}) - PENALTY! Blue requires SWIPE! -99 points", x, y);
-                        -99
+                Err(_) => info!("display fill error for color {}", i + 1),
+            }
+            
+            // Wait for touch within the time limit or timeout
+            let timeout_duration = Duration::from_millis(COLOR_DISPLAY_DURATION_MS);
+            match embassy_time::with_timeout(timeout_duration, events.receive()).await {
+                Ok(touch_event) => {
+                    // Touch received in time - continue game
+                    info!("Touch received: {:?}", touch_event);
+                }
+                Err(_) => {
+                    // Timeout - no touch received, show DEAD screen
+                    info!("No touch received - GAME OVER");
+                    show_dead_screen(display, fb_buf);
+                    
+                    // Wait for touch to restart game
+                    info!("Waiting for touch to restart...");
+                    let restart_touch = events.receive().await;
+                    info!("Touch received - RESTARTING GAME: {:?}", restart_touch);
+                    
+                    // Clear any remaining events in the queue
+                    while events.try_receive().is_ok() {
+                        // Drain any pending touch events
                     }
-                    (GestureEvent::Touch { x, y }, false) => {
-                        // Touch on non-blue = correct
-                        info!("TOUCH on {} at ({}, {}) - CORRECT! +{} points", color_name, x, y, base_points);
-                        base_points
-                    }
-                    (GestureEvent::Swipe { start_x, start_y, end_x, end_y }, true) => {
-                        // Swipe on blue = correct
-                        info!("SWIPE on BLUE from ({}, {}) to ({}, {}) - CORRECT! +{} points", 
-                              start_x, start_y, end_x, end_y, base_points);
-                        base_points
-                    }
-                    (GestureEvent::Swipe { start_x, start_y, end_x, end_y }, false) => {
-                        // Swipe on non-blue = penalty (non-blue requires touch)
-                        info!("SWIPE on {} from ({}, {}) to ({}, {}) - PENALTY! {} requires TOUCH! -99 points", 
-                              color_name, start_x, start_y, end_x, end_y, color_name);
-                        -99
-                    }
-                };
-                
-                // Update total points
-                let total_points = {
-                    let mut total = TOTAL_POINTS.lock().await;
-                    *total += points;
-                    *total
-                };
-                
-                info!("Points this round: {}, Total points: {}", points, total_points);
-                
-                // Display the points (show penalty with negative sign, others with + sign)
-                if points < 0 {
-                    draw_negative_num(display, fb_buf, (-points) as u32); // Show as negative
-                } else {
-                    draw_num_with_prefix(display, fb_buf, points as u32, true); // Show with + prefix
+                    
+                    // Break out of current color loop to restart the game
+                    break;
                 }
             }
-            Err(_) => info!("display fill error"),
+        }
+        
+        info!("3-color sequence complete, waiting for next cycle...");
+        
+        // Wait before starting next sequence
+        Timer::after(Duration::from_millis(CYCLE_PAUSE_DURATION_MS)).await;
+    }
+}
+
+fn show_dead_screen(display: &mut DisplayDriver, fb_buf: &mut [Rgb565]) {
+    let area = display.bounding_box();
+    
+    // Fill screen with black
+    let _ = display.fill_solid(&area, Rgb565::BLACK);
+    
+    // Draw "DEAD" text in white
+    draw_dead_text(display, fb_buf);
+}
+
+fn draw_dead_text(display: &mut DisplayDriver, fb_buf: &mut [Rgb565]) {
+    // 1) Render "DEAD" text into offscreen framebuffer
+    let text_style = MonoTextStyle::new(&FONT_9X18, Rgb565::WHITE); // White text
+    let mut fb = SimpleFb::new(fb_buf);
+    fb.clear(Rgb565::BLACK); // Black background
+    
+    let text_obj = Text::with_alignment("DEAD", Point::new(0, 18), text_style, Alignment::Left);
+    let _ = text_obj.draw(&mut fb);
+
+    // 2) Calculate scale to make "DEAD" text large
+    let max_usable_height = (DISPLAY_HEIGHT - 10) as i32;
+    let max_usable_width = (DISPLAY_WIDTH * 3 / 4) as i32;
+    
+    // Text width for "DEAD" (4 characters * 9 pixels each)
+    let text_width_pixels = 4 * 9;
+    
+    // Calculate scale factors
+    let height_scale = max_usable_height / FB_H as i32;
+    let width_scale = max_usable_width / text_width_pixels;
+    
+    // Use the smaller scale
+    let scale = height_scale.min(width_scale).max(1);
+    let out_h = (FB_H as i32 * scale) as u16;
+
+    // 3) Position on screen - centered
+    let bb = display.bounding_box();
+    let cy = bb.center().y.max(0) as i32;
+    let cx = bb.center().x.max(0) as i32;
+    let text_display_width = text_width_pixels * scale;
+    let origin_x = cx - (text_display_width / 2);
+    let origin_y = cy - (out_h as i32 / 2);
+
+    // 4) Blit white text on black background
+    for sy in 0..FB_H {
+        for sx in 0..FB_W {
+            let src = fb_buf[sy * FB_W + sx];
+            if src != Rgb565::BLACK { // Only draw white pixels
+                let x = origin_x + (sx as i32 * scale);
+                let y = origin_y + (sy as i32 * scale);
+                
+                if x >= 0 && y >= 0 && (y + scale) <= DISPLAY_HEIGHT as i32 {
+                    let rect = Rectangle::new(Point::new(x, y), Size::new(scale as u32, scale as u32));
+                    let _ = rect.into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(src)).draw(display);
+                }
+            }
         }
     }
 }
@@ -509,7 +528,14 @@ async fn touch_task(
     const MIN_SWIPE_DISTANCE: u16 = 30; // Minimum distance to consider it a swipe
     const MAX_TOUCH_DISTANCE: u16 = 10;  // Maximum movement for a tap
 
+    let mut poll_count = 0;
+    let mut last_touch_time = 0u32;
     loop {
+        poll_count += 1;
+        if poll_count % 1500 == 0 {  // Log every 30 seconds (1500 * 20ms) - much less frequent
+            info!("Touch task alive: poll #{}, last touch at poll #{}", poll_count, last_touch_time);
+        }
+        
         match touch.get_touch_data() {
             Ok(Some(report)) => {
                 if let Some(point) = report.points.first() {
@@ -520,6 +546,7 @@ async fn touch_task(
                         touch_start = Some(current_pos);
                         last_position = Some(current_pos);
                         touch_active = true;
+                        last_touch_time = poll_count;
                         info!("touch start: ({}, {})", point.x, point.y);
                     } else {
                         // Update last known position while touch is active
@@ -567,13 +594,15 @@ async fn touch_task(
                 }
             }
             Err(_) => {
-                info!("touch read error");
+                info!("touch read error, resetting touch state");
                 touch_active = false;
                 touch_start = None;
                 last_position = None;
+                // Add a longer delay after error to let the controller recover
+                Timer::after(Duration::from_millis(100)).await;
             }
         }
-        Timer::after(Duration::from_millis(10)).await;
+        Timer::after(Duration::from_millis(20)).await; // Increased polling interval
     }
 }
 
@@ -582,6 +611,10 @@ async fn main(spawner: Spawner) {
     // generator version: 0.5.0
 
     rtt_target::rtt_init_defmt!();
+
+    // Give RTT time to initialize
+    let mut delay = Delay::new();
+    delay.delay_millis(100);
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
