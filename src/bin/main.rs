@@ -21,10 +21,11 @@ use embedded_graphics::{
 };
 use embassy_executor::Spawner;
 use embassy_sync::{
-    blocking_mutex::raw::NoopRawMutex,
+    blocking_mutex::raw::{NoopRawMutex, CriticalSectionRawMutex},
     channel::Channel,
+    mutex::Mutex,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, Instant};
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Io, Level, Output, OutputConfig};
@@ -78,14 +79,125 @@ const RAINBOW: [Rgb565; 7] = [
     Rgb565::new(31, 0, 31),  // Violet
 ];
 
-const FB_W: usize = 86;   // enough for "+5" in 9x18 with padding
-const FB_H: usize = 24;   // 18px font + margin
+const FB_W: usize = 100;  // Extra wide to ensure no cut-off in framebuffer
+const FB_H: usize = 24;   // Keep height small for big vertical scaling
 
 static FB_STORAGE: StaticCell<[Rgb565; FB_W * FB_H]> = StaticCell::new();
 static SPI_BUFFER: StaticCell<[u8; SPI_BUFFER_SIZE]> = StaticCell::new();
 static DISPLAY: StaticCell<DisplayDriver> = StaticCell::new();
 static TOUCH: StaticCell<Axs5106l<I2c<'static, Blocking>, Output<'static>>> = StaticCell::new();
 static TOUCH_EVENTS: StaticCell<Channel<NoopRawMutex, TouchEvent, 4>> = StaticCell::new();
+
+// Global timer state
+static TIMER_START: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
+
+fn draw_num(display: &mut DisplayDriver, fb_buf: &mut [Rgb565], num: u32) {
+    draw_num_with_prefix(display, fb_buf, num, false);
+}
+
+fn draw_num_with_prefix(display: &mut DisplayDriver, fb_buf: &mut [Rgb565], num: u32, show_plus: bool) {
+    // 1) Render small text into offscreen framebuffer
+    let text_style = MonoTextStyle::new(&FONT_9X18, Rgb565::BLACK);
+    let mut fb = SimpleFb::new(fb_buf);
+    fb.clear(Rgb565::WHITE);
+    
+    // Format the number as a string
+    let mut buffer = [0u8; 12]; // enough for "+4294967295"
+    let num_str = if show_plus {
+        format_num_with_plus_to_str(num, &mut buffer)
+    } else {
+        format_num_to_str(num, &mut buffer)
+    };
+    
+    let text = Text::with_alignment(num_str, Point::new(0, 18), text_style, Alignment::Left);
+    let _ = text.draw(&mut fb);
+
+    // 2) Choose scale to make text HUGE - use most of the screen height
+    let max_usable_height = (DISPLAY_HEIGHT - 10) as i32; // Use almost full height
+    let mut scale = max_usable_height / FB_H as i32; // Calculate maximum possible scale
+    let _out_w = (FB_W as i32 * scale) as u16; // Width not needed for left-aligned positioning
+    let out_h = (FB_H as i32 * scale) as u16;
+
+    // 3) Position on screen - left-aligned with some margin
+    let bb = display.bounding_box();
+    let margin = 10i32; // Left margin from screen edge
+    let cy = bb.center().y.max(0) as i32;
+    let origin_x = margin; // Left-aligned instead of centered
+    let origin_y = cy - (out_h as i32 / 2); // Still center vertically
+
+    // 4) Blit with nearest-neighbor: draw each source pixel as a filled rect of size scale
+    for sy in 0..FB_H {
+        for sx in 0..FB_W {
+            let src = fb_buf[sy * FB_W + sx];
+            if src != Rgb565::WHITE { // treat white as transparent/background
+                let x = origin_x + (sx as i32 * scale);
+                let y = origin_y + (sy as i32 * scale);
+                
+                // // Check bounds to avoid drawing beyond screen edges
+                if x >= 0 && y >= 0 && 
+                //    (x + scale) <= DISPLAY_WIDTH as i32 && 
+                   (y + scale) <= DISPLAY_HEIGHT as i32 {
+                    let rect = Rectangle::new(Point::new(x, y), Size::new(scale as u32, scale as u32));
+                    let _ = rect.into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(src)).draw(display);
+                }
+            }
+        }
+    }
+}
+
+fn format_num_to_str(num: u32, buffer: &mut [u8]) -> &str {
+    if num == 0 {
+        buffer[0] = b'0';
+        return core::str::from_utf8(&buffer[0..1]).unwrap();
+    }
+    
+    let mut n = num;
+    let mut len = 0;
+    
+    // Count digits
+    let mut temp = num;
+    while temp > 0 {
+        len += 1;
+        temp /= 10;
+    }
+    
+    // Fill buffer from right to left
+    for i in 0..len {
+        buffer[len - 1 - i] = (n % 10) as u8 + b'0';
+        n /= 10;
+    }
+    
+    core::str::from_utf8(&buffer[0..len]).unwrap()
+}
+
+fn format_num_with_plus_to_str(num: u32, buffer: &mut [u8]) -> &str {
+    if num == 0 {
+        buffer[0] = b'+';
+        buffer[1] = b'0';
+        return core::str::from_utf8(&buffer[0..2]).unwrap();
+    }
+    
+    let mut n = num;
+    let mut len = 0;
+    
+    // Count digits
+    let mut temp = num;
+    while temp > 0 {
+        len += 1;
+        temp /= 10;
+    }
+    
+    // Fill buffer from right to left (leaving space for '+')
+    for i in 0..len {
+        buffer[len - i] = (n % 10) as u8 + b'0';
+        n /= 10;
+    }
+    
+    // Add the '+' prefix
+    buffer[0] = b'+';
+    
+    core::str::from_utf8(&buffer[0..len + 1]).unwrap()
+}
 
 struct SimpleFb<'a> {
     buf: &'a mut [Rgb565],
@@ -128,58 +240,55 @@ async fn display_task(
     events: &'static Channel<NoopRawMutex, TouchEvent, 4>,
 ) {
     let mut lfsr: u32 = 0xACE1u32;
-        let fb_buf = FB_STORAGE.init([Rgb565::BLACK; FB_W * FB_H]);
+    let fb_buf = FB_STORAGE.init([Rgb565::BLACK; FB_W * FB_H]);
 
     loop {
         let _ = events.receive().await;
+        
+        let now = Instant::now();
+        let ms_elapsed = {
+            let mut timer_start = TIMER_START.lock().await;
+            let elapsed_ms = match *timer_start {
+                Some(start_time) => {
+                    let elapsed = now.duration_since(start_time);
+                    elapsed.as_millis() as u32
+                }
+                None => 0, // First touch
+            };
+            
+            // Reset timer for next measurement
+            *timer_start = Some(now);
+            elapsed_ms
+        };
+        
+        // Generate new color
         lfsr ^= lfsr << 13;
         lfsr ^= lfsr >> 17;
         lfsr ^= lfsr << 5;
-        let color = RAINBOW[(lfsr as usize) % RAINBOW.len()]; // TODO random color
+        let color = RAINBOW[(lfsr as usize) % RAINBOW.len()];
         let area = display.bounding_box();
+        
         match display.fill_solid(&area, color) {
             Ok(_) => {
                 let raw = color.into_storage();
-                info!("display color: {=u16:x}", raw);
                 
-                // 1) Render small text into offscreen framebuffer
-                let text_style = MonoTextStyle::new(&FONT_9X18, Rgb565::BLACK);
-                let mut fb = SimpleFb::new(fb_buf);
-                fb.clear(Rgb565::WHITE);
-                let text = Text::with_alignment("+5", Point::new(0, 18), text_style, Alignment::Left);
-                let _ = text.draw(&mut fb);
-
-                // 2) Choose scale so height > 100 px but fits the screen
-                let min_target_h = 100i32;
-                let mut scale = (min_target_h + FB_H as i32 - 1) / FB_H as i32; // ceil
-                if scale < 2 { scale = 2; }
-                // keep within screen bounds
-                while (FB_W as i32 * scale) as u16 > DISPLAY_WIDTH || (FB_H as i32 * scale) as u16 > DISPLAY_HEIGHT {
-                    scale -= 1;
-                    if scale <= 1 { break; }
-                }
-                let out_w = (FB_W as i32 * scale) as u16;
-                let out_h = (FB_H as i32 * scale) as u16;
-
-                // 3) Center on screen
-                let bb = display.bounding_box();
-                let cx = bb.center().x.max(0) as i32;
-                let cy = bb.center().y.max(0) as i32;
-                let origin_x = cx - (out_w as i32 / 2);
-                let origin_y = cy - (out_h as i32 / 2);
-
-                // 4) Blit with nearest-neighbor: draw each source pixel as a filled rect of size scale
-                for sy in 0..FB_H {
-                    for sx in 0..FB_W {
-                        let src = fb_buf[sy * FB_W + sx];
-                        if src != Rgb565::WHITE { // treat white as transparent/background
-                            let x = origin_x + (sx as i32 * scale);
-                            let y = origin_y + (sy as i32 * scale);
-                            let rect = Rectangle::new(Point::new(x, y), Size::new(scale as u32, scale as u32));
-                            let _ = rect.into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(src)).draw(display);
-                        }
-                    }
-                }
+                // Linear formula: f(time) = a * time + b
+                // Where: a = -0.1, b = 110
+                // Formula: points = -0.1 * elapsed_ms + 110
+                // Examples: 100ms -> +100, 500ms -> +60, 1000ms -> +10
+                let points = if ms_elapsed > 0 {
+                    let a = -0.2_f32;
+                    let b = 110.0_f32;
+                    let result = a * (ms_elapsed as f32) + b;
+                    (result as u32).max(1) // Minimum 1 point
+                } else {
+                    100 // First touch gets 100 points
+                };
+                
+                info!("display color: {=u16:x}, elapsed: {}ms -> points: +{}", raw, ms_elapsed, points);
+                
+                // Display the calculated points with + prefix
+                draw_num_with_prefix(display, fb_buf, points, true);
             }
             Err(_) => info!("display fill error"),
         }
