@@ -76,14 +76,26 @@ const DISPLAY_HEIGHT: u16 = 320;
 const DISPLAY_X_OFFSET: u16 = 34;
 const DISPLAY_Y_OFFSET: u16 = 0;
 const SPI_BUFFER_SIZE: usize = 1024;
+// Original RGB RAINBOW (for reference)
+// const RAINBOW: [Rgb565; 7] = [
+//     Rgb565::new(31, 0, 0),   // Red
+//     Rgb565::new(31, 20, 0),  // Orange
+//     Rgb565::new(31, 63, 0),  // Yellow
+//     Rgb565::new(0, 63, 0),   // Green
+//     Rgb565::new(0, 0, 31),   // Blue
+//     Rgb565::new(8, 0, 31),   // Indigo
+//     Rgb565::new(31, 0, 31),  // Violet
+// ];
+
+// BGR RAINBOW (R and B channels swapped for BGR display)
 const RAINBOW: [Rgb565; 7] = [
-    Rgb565::new(31, 0, 0),   // Red
-    Rgb565::new(31, 20, 0),  // Orange
-    Rgb565::new(31, 63, 0),  // Yellow
-    Rgb565::new(0, 63, 0),   // Green
-    Rgb565::new(0, 0, 31),   // Blue
-    Rgb565::new(8, 0, 31),   // Indigo
-    Rgb565::new(31, 0, 31),  // Violet
+    Rgb565::new(0, 0, 31),   // Red (R and B swapped)
+    Rgb565::new(0, 20, 31),  // Orange (R and B swapped)
+    Rgb565::new(0, 63, 31),  // Yellow (R and B swapped)
+    Rgb565::new(0, 63, 0),   // Green (stays same)
+    Rgb565::new(31, 0, 0),   // Blue (R and B swapped)
+    Rgb565::new(31, 0, 8),   // Indigo (R and B swapped)
+    Rgb565::new(31, 0, 31),  // Violet (stays same - symmetric)
 ];
 
 const FB_W: usize = 100;  // Extra wide to ensure no cut-off in framebuffer
@@ -98,8 +110,54 @@ static TOUCH_EVENTS: StaticCell<Channel<NoopRawMutex, TouchEvent, 4>> = StaticCe
 // Global timer state
 static TIMER_START: Mutex<CriticalSectionRawMutex, Option<Instant>> = Mutex::new(None);
 
+// Global points tracker
+static TOTAL_POINTS: Mutex<CriticalSectionRawMutex, i32> = Mutex::new(0);
+
 fn draw_num(display: &mut DisplayDriver, fb_buf: &mut [Rgb565], num: u32) {
     draw_num_with_prefix(display, fb_buf, num, false);
+}
+
+fn draw_negative_num(display: &mut DisplayDriver, fb_buf: &mut [Rgb565], num: u32) {
+    // 1) Render small text into offscreen framebuffer
+    let text_style = MonoTextStyle::new(&FONT_9X18, Rgb565::BLACK);
+    let mut fb = SimpleFb::new(fb_buf);
+    fb.clear(Rgb565::WHITE);
+    
+    // Format the number as a string with negative sign
+    let mut buffer = [0u8; 12]; // enough for "-4294967295"
+    let num_str = format_num_with_minus_to_str(num, &mut buffer);
+    
+    let text = Text::with_alignment(num_str, Point::new(0, 18), text_style, Alignment::Left);
+    let _ = text.draw(&mut fb);
+
+    // 2) Choose scale to make text HUGE - use most of the screen height
+    let max_usable_height = (DISPLAY_HEIGHT - 10) as i32; // Use almost full height
+    let scale = max_usable_height / FB_H as i32; // Calculate maximum possible scale
+    let out_h = (FB_H as i32 * scale) as u16;
+
+    // 3) Position on screen - left-aligned with some margin
+    let bb = display.bounding_box();
+    let margin = 10i32; // Left margin from screen edge
+    let cy = bb.center().y.max(0) as i32;
+    let origin_x = margin; // Left-aligned instead of centered
+    let origin_y = cy - (out_h as i32 / 2); // Still center vertically
+
+    // 4) Blit with nearest-neighbor: draw each source pixel as a filled rect of size scale
+    for sy in 0..FB_H {
+        for sx in 0..FB_W {
+            let src = fb_buf[sy * FB_W + sx];
+            if src != Rgb565::WHITE { // treat white as transparent/background
+                let x = origin_x + (sx as i32 * scale);
+                let y = origin_y + (sy as i32 * scale);
+                
+                // Check bounds to avoid drawing beyond screen edges
+                if x >= 0 && y >= 0 && (y + scale) <= DISPLAY_HEIGHT as i32 {
+                    let rect = Rectangle::new(Point::new(x, y), Size::new(scale as u32, scale as u32));
+                    let _ = rect.into_styled(embedded_graphics::primitives::PrimitiveStyle::with_fill(src)).draw(display);
+                }
+            }
+        }
+    }
 }
 
 fn draw_num_with_prefix(display: &mut DisplayDriver, fb_buf: &mut [Rgb565], num: u32, show_plus: bool) {
@@ -202,6 +260,35 @@ fn format_num_with_plus_to_str(num: u32, buffer: &mut [u8]) -> &str {
     
     // Add the '+' prefix
     buffer[0] = b'+';
+    
+    core::str::from_utf8(&buffer[0..len + 1]).unwrap()
+}
+
+fn format_num_with_minus_to_str(num: u32, buffer: &mut [u8]) -> &str {
+    if num == 0 {
+        buffer[0] = b'-';
+        buffer[1] = b'0';
+        return core::str::from_utf8(&buffer[0..2]).unwrap();
+    }
+    
+    let mut n = num;
+    let mut len = 0;
+    
+    // Count digits
+    let mut temp = num;
+    while temp > 0 {
+        len += 1;
+        temp /= 10;
+    }
+    
+    // Fill buffer from right to left (leaving space for '-')
+    for i in 0..len {
+        buffer[len - i] = (n % 10) as u8 + b'0';
+        n /= 10;
+    }
+    
+    // Add the '-' prefix
+    buffer[0] = b'-';
     
     core::str::from_utf8(&buffer[0..len + 1]).unwrap()
 }
@@ -315,32 +402,78 @@ async fn display_task(
         
         match display.fill_solid(&area, color) {
             Ok(_) => {
+                // Print current color to console
+                let raw_color = color.into_storage();
                 
-                // Linear formula: f(time) = a * time + b
-                // Where: a = -0.1, b = 110
-                // Formula: points = -0.1 * elapsed_ms + 110
-                // Examples: 100ms -> +100, 500ms -> +60, 1000ms -> +10
-                let points = if ms_elapsed > 0 {
+                // Generate color name by comparing with actual RAINBOW array values
+                let color_names = ["Red", "Orange", "Yellow", "Green", "Blue", "Indigo", "Violet"];
+                let mut color_name = "Unknown";
+                let mut color_index = None;
+                
+                for (i, rainbow_color) in RAINBOW.iter().enumerate() {
+                    if rainbow_color.into_storage() == raw_color {
+                        color_name = color_names[i];
+                        color_index = Some(i);
+                        break;
+                    }
+                }
+                
+                info!("Current color displayed: {} (raw: {=u16:x})", color_name, raw_color);
+                
+                // Check if current color is blue (index 4 in RAINBOW array)
+                let is_blue = color_index == Some(4); // Blue is at index 4 in RAINBOW
+                
+                // Calculate base points using linear formula
+                let base_points = if ms_elapsed > 0 {
                     let a = -0.2_f32;
                     let b = 110.0_f32;
                     let result = a * (ms_elapsed as f32) + b;
-                    (result as u32).max(1) // Minimum 1 point
+                    (result as i32).max(1) // Minimum 1 point
                 } else {
                     100 // First gesture gets 100 points
                 };
                 
-                match gesture_event {
-                    GestureEvent::Touch { x, y } => {
-                        info!("TOUCH at ({}, {}), elapsed: {}ms -> points: +{}", x, y, ms_elapsed, points);
+                // Apply gesture rules based on color
+                let points = match (gesture_event, is_blue) {
+                    (GestureEvent::Touch { x, y }, true) => {
+                        // Touch on blue = penalty (blue requires swipe)
+                        info!("TOUCH on BLUE at ({}, {}) - PENALTY! Blue requires SWIPE! -99 points", x, y);
+                        -99
                     }
-                    GestureEvent::Swipe { start_x, start_y, end_x, end_y } => {
-                        info!("SWIPE from ({}, {}) to ({}, {}), elapsed: {}ms -> points: +{}", 
-                              start_x, start_y, end_x, end_y, ms_elapsed, points);
+                    (GestureEvent::Touch { x, y }, false) => {
+                        // Touch on non-blue = correct
+                        info!("TOUCH on {} at ({}, {}) - CORRECT! +{} points", color_name, x, y, base_points);
+                        base_points
                     }
-                }
+                    (GestureEvent::Swipe { start_x, start_y, end_x, end_y }, true) => {
+                        // Swipe on blue = correct
+                        info!("SWIPE on BLUE from ({}, {}) to ({}, {}) - CORRECT! +{} points", 
+                              start_x, start_y, end_x, end_y, base_points);
+                        base_points
+                    }
+                    (GestureEvent::Swipe { start_x, start_y, end_x, end_y }, false) => {
+                        // Swipe on non-blue = penalty (non-blue requires touch)
+                        info!("SWIPE on {} from ({}, {}) to ({}, {}) - PENALTY! {} requires TOUCH! -99 points", 
+                              color_name, start_x, start_y, end_x, end_y, color_name);
+                        -99
+                    }
+                };
                 
-                // Display the calculated points with + prefix
-                draw_num_with_prefix(display, fb_buf, points, true);
+                // Update total points
+                let total_points = {
+                    let mut total = TOTAL_POINTS.lock().await;
+                    *total += points;
+                    *total
+                };
+                
+                info!("Points this round: {}, Total points: {}", points, total_points);
+                
+                // Display the points (show penalty with negative sign, others with + sign)
+                if points < 0 {
+                    draw_negative_num(display, fb_buf, (-points) as u32); // Show as negative
+                } else {
+                    draw_num_with_prefix(display, fb_buf, points as u32, true); // Show with + prefix
+                }
             }
             Err(_) => info!("display fill error"),
         }
